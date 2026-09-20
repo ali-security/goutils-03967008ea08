@@ -1,0 +1,123 @@
+name: Build module zip
+
+# Manual dispatch only: this repo is a fork sync target, and any push /
+# pull_request / schedule trigger would burn CI on every sync. No inputs are
+# declared -- this workflow packs the module zip and runs no tests (the test
+# suite runs on Travis), so there is nothing a test-filter input could drive.
+on:
+  workflow_dispatch:
+
+jobs:
+  pack:
+    name: Pack github.com/Masterminds/goutils@v1.1.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MODULE_PATH: github.com/Masterminds/goutils
+      MODULE_VERSION: v1.1.0
+      XMOD_VERSION: v0.21.0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          # This is a pre-modules, GOPATH-era library: it ships no go.mod and no
+          # go.sum, so setup-go's default dependency cache has no lock file to
+          # key on and would fail the step.
+          cache: false
+
+      - name: Stage the module tree outside the checkout
+        run: |
+          set -euo pipefail
+          rm -rf "${RUNNER_TEMP}/stage"
+          mkdir -p "${RUNNER_TEMP}/stage"
+          # The zip is packed from whatever sits in the staged directory, so the
+          # staging copy lives OUTSIDE the checkout and drops the two trees that
+          # must never reach the artifact: .git/ and the .github/ workflow this
+          # repo carries for the fork build. The published v1.1.0 zip contains
+          # neither, and any extra member breaks byte-equivalence.
+          rsync -a --exclude '.git/' --exclude '.github/' ./ "${RUNNER_TEMP}/stage/"
+          echo "Staged tree:"
+          ls -a "${RUNNER_TEMP}/stage"
+
+      - name: Build the module-zip packer outside the staged tree
+        run: |
+          set -euo pipefail
+          # golang.org/x/mod/zip.CreateFromDir is Go's own module-zip writer and
+          # applies the proxy's exact inclusion rules. It needs a go.mod for
+          # ITSELF, not for the packed tree -- so the throwaway module is created
+          # in a temp dir outside both the checkout and the staged tree. No go.mod
+          # is written into the repo or into ${RUNNER_TEMP}/stage, which is what
+          # keeps the artifact matching the public zip (which has no go.mod
+          # member: v1.1.0 predates Go modules).
+          rm -rf "${RUNNER_TEMP}/packer"
+          mkdir -p "${RUNNER_TEMP}/packer"
+          cat > "${RUNNER_TEMP}/packer/main.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: packer <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "${RUNNER_TEMP}/packer"
+          go mod init seal.local/packer
+          go get "golang.org/x/mod@${XMOD_VERSION}"
+          go build -o "${RUNNER_TEMP}/packer/packer" .
+
+      - name: Pack the module zip
+        run: |
+          set -euo pipefail
+          rm -rf "${RUNNER_TEMP}/build_output"
+          mkdir -p "${RUNNER_TEMP}/build_output"
+          zip_path="${RUNNER_TEMP}/build_output/${MODULE_VERSION}.zip"
+          "${RUNNER_TEMP}/packer/packer" \
+            "${MODULE_PATH}" \
+            "${MODULE_VERSION}" \
+            "${RUNNER_TEMP}/stage" \
+            "${zip_path}"
+          unzip -Z1 "${zip_path}" > "${RUNNER_TEMP}/members.txt"
+          echo "Module zip members:"
+          cat "${RUNNER_TEMP}/members.txt"
+          # Every member must sit under the real, cased module path. The proxy URL
+          # case-encodes Masterminds as !masterminds, but the paths INSIDE the zip
+          # use the real module path.
+          if grep -cv "^${MODULE_PATH}@${MODULE_VERSION}/" "${RUNNER_TEMP}/members.txt"; then
+            echo "::error::module zip has members outside ${MODULE_PATH}@${MODULE_VERSION}/"
+            exit 1
+          fi
+          # Nothing absent from the published zip may ship in ours.
+          if grep -Ec "(^|/)(\.github/|go\.mod$)" "${RUNNER_TEMP}/members.txt"; then
+            echo "::error::module zip contains files absent from the published ${MODULE_VERSION} zip"
+            exit 1
+          fi
+          sha256sum "${zip_path}"
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: goutils-module-zip
+          path: ${{ runner.temp }}/build_output/v1.1.0.zip
+          if-no-files-found: error

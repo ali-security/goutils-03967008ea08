@@ -1,10 +1,14 @@
 language: go
 
+go_import_path: github.com/Masterminds/goutils
+
 go:
-  - 1.6
-  - 1.7
-  - 1.8
-  - tip
+  - "1.8"
+  - "1.9"
+  - "1.10"
+  - "1.11.2"
+
+install: true
 
 script:
   - go test -v
